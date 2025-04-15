@@ -1,0 +1,149 @@
+
+int main() {
+    create_directory_if_not_exists("frames");
+
+    // 1. Cargar modelo con verificación mejorada
+    STL_MODEL head_model;
+    if (!load_stl_ascii("cara2.stl", &head_model)) {
+        fprintf(stderr, "Error cargando modelo STL\n");
+        return 1;
+    }
+
+
+
+    // Escalado seguro del modelo
+    printf("Escalando modelo...\n");
+    center_and_scale_model(&head_model, 500.0);
+    printf("Modelo cargado: %d triángulos\n", head_model.count);
+
+    // 2. Configuración de renderizado
+    const float camera_radius = 800.0;
+    const float camera_height = 300.0;
+    const VEC3_T look_at = {0.0, 0.0, 500.0};
+    const VEC3_T up = {0.0, 1.0, 0.0};
+    const float inv_side = 1.0f / (SIDE / 2.0f);  // Precalcular
+
+    // 3. Bucle principal de renderizado
+
+    //    int frame = 0; frame < TOTAL_FRAMES; ++frame
+    for (int frame = 0; frame < TOTAL_FRAMES; ++frame) {
+        printf("Iniciando frame %d/%d...\n", frame+1, TOTAL_FRAMES);
+        char filename[64];
+        sprintf(filename, "frames/frame_%03d.pgm", frame);
+
+        FILE *fp = fopen(filename, "w");
+        if (!fp) {
+            perror("Error al crear archivo");
+            free(head_model.triangles);
+            return 1;
+        }
+
+        // Configuración de cámara
+        float angle = (2 * M_PI * frame) / TOTAL_FRAMES;
+        VEC3_T camera_position = {
+            camera_radius * cosf(angle),
+            camera_height,
+            camera_radius * sinf(angle) // + look_at.z  es lo que tenia ahi pegado
+        };
+        const VEC3_T look_at = {0.0, 0.0, 0.0};
+// const VEC3_T look_at = {0.0, 0.0, 0.0}; es la ultima implementacion 
+
+
+
+
+        // Sistema de coordenadas de cámara
+        VEC3_T forward = VEC3_normalize(VEC3_sub(look_at, camera_position));
+        VEC3_T right = VEC3_normalize(VEC3_cross(forward, up));
+        VEC3_T real_up = VEC3_normalize(VEC3_cross(right, forward));
+
+        // Configuración de iluminación
+        VEC3_T light_pos = {
+            camera_position.x + 200.0f,
+            camera_position.y + 500.0f,
+            camera_position.z - 200.0f
+        };
+        VEC3_T light_dir = VEC3_normalize(VEC3_sub(light_pos, look_at));
+
+        // Escribir encabezado PGM
+        fprintf(fp, "P2\n%d %d\n%d\n", SIDE, SIDE, SCALE);
+
+        // Renderizado paralelo con buffers por hilo
+        #pragma omp parallel for schedule(dynamic)
+        for (int y = 0; y < SIDE; y++) {
+            char pixel_buffer[SIDE * 12];  // Buffer para una fila completa
+            int buf_pos = 0;
+            int screen_y = SIDE - 1 - y;  // Convertir coordenada Y
+
+            for (int x = 0; x < SIDE; x++) {
+                // Coordenadas normalizadas del píxel
+                float px = (x - SIDE/2.0f) * inv_side;
+                float py = (screen_y - SIDE/2.0f) * inv_side;
+
+                // Generar dirección del rayo
+                VEC3_T ray_dir = VEC3_normalize(VEC3_add(
+                    VEC3_add(VEC3_scale(right, px), VEC3_scale(real_up, py)),
+                    forward
+                ));
+
+                RAY_T ray = {camera_position, ray_dir};
+
+                // Búsqueda de intersección
+                float closest_t = SKY;
+                VEC3_T hit_normal = {0};
+                int intersected = 0;
+
+                for (int i = 0; i < head_model.count; i++) {
+                    float t;
+                    if (ray_triangle_intersect(ray, head_model.triangles[i], &t) && t < closest_t) {
+                        closest_t = t;
+                        hit_normal = head_model.triangles[i].normal;
+                        intersected = 1;
+                    }
+                }
+
+                // Cálculo de iluminación
+                float shade = 0.1f;  // Componente ambiental
+                if (intersected) {
+                    VEC3_T hit_point = VEC3_add(ray.o, VEC3_scale(ray.d, closest_t));
+
+                    // Rayo de sombra con pequeño offset
+                    RAY_T shadow_ray = {
+                        VEC3_add(hit_point, VEC3_scale(hit_normal, 0.001f)),
+                        light_dir
+                    };
+
+                    int in_shadow = 0;
+                    for (int i = 0; i < head_model.count && !in_shadow; i++) {
+                        float t;
+                        if (ray_triangle_intersect(shadow_ray, head_model.triangles[i], &t) && t > 0.001f) {
+                            in_shadow = 1;
+                        }
+                    }
+
+                    if (!in_shadow) {
+                        float diffuse = VEC3_dot(hit_normal, light_dir);
+                        shade += 0.9f * fmaxf(0.0f, diffuse);
+                    }
+                }
+
+                // Escribir en buffer
+                int pixel_value = (int)(fminf(shade, 1.0f) * SCALE);
+                buf_pos += sprintf(pixel_buffer + buf_pos, "%d ", pixel_value);
+            }
+
+            // Escribir fila completa (sección crítica)
+            #pragma omp critical
+            {
+                fprintf(fp, "%s\n", pixel_buffer);
+            }
+        }
+
+        fclose(fp);
+        printf("Frame %d completado\n", frame+1);
+    }
+
+    free(head_model.triangles);
+    printf("Renderizado completado!\n");
+    return 0;
+}
+
